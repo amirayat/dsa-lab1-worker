@@ -1,6 +1,7 @@
 """
 Azure Function Worker — Timer Trigger (every 30 seconds)
 Processes one queued image per invocation.
+
 Student: Amir Ayat, Internal Code: F3319, Variant: 7 (Azure Face)
 """
 import os
@@ -15,20 +16,37 @@ from azure.storage.blob.aio import BlobServiceClient
 from azure.ai.vision.face.aio import FaceClient
 from azure.core.credentials import AzureKeyCredential
 
+# ============================================================
+# IMPORTANT: FunctionApp() must be created at module level.
+# Azure Functions Python runtime looks for this object to
+# register all @app.<trigger> decorated functions.
+# ============================================================
 app = func.FunctionApp()
 
 
-# ---------- Config from env vars ----------
+# ---------- Helper ----------
+
 def _env(name: str) -> str:
+    """Return an environment variable or raise if missing."""
     v = os.environ.get(name)
     if not v:
         raise ValueError(f"Missing environment variable: {name}")
     return v
 
 
+# ---------- Worker logic ----------
+
 async def process_one_message() -> None:
-    """Receive one message from Service Bus, process it, update DB."""
-    # Read env vars inside the function so Azure picks up latest values
+    """
+    Receive one message from Service Bus, process it, update PostgreSQL.
+
+    FSM states used:
+      q1 Queued         — set by the API when the image is submitted
+      q2 Sending        — set here just before the Azure Face call
+      q4 SingleFaceDetected / q5 MultipleFacesDetected / q6 NoFaceDetected
+      q7 ResultsReady   — set after saving result_json
+    """
+    # Read env vars inside the function so Azure picks up changes without restart
     POSTGRES_HOST = _env("POSTGRES_HOST")
     POSTGRES_PORT = int(os.environ.get("POSTGRES_PORT", "5432"))
     POSTGRES_DB = _env("POSTGRES_DB")
@@ -41,6 +59,7 @@ async def process_one_message() -> None:
     FACE_KEY = _env("AZURE_FACE_KEY")
     FACE_ENDPOINT = _env("AZURE_FACE_ENDPOINT")
 
+    # 1. Connect to PostgreSQL
     pool = await asyncpg.create_pool(
         host=POSTGRES_HOST,
         port=POSTGRES_PORT,
@@ -53,13 +72,16 @@ async def process_one_message() -> None:
     )
 
     try:
+        # 2. Connect to Service Bus and receive one message
         async with ServiceBusClient.from_connection_string(SB_CONN_STR) as sb:
             receiver = sb.get_queue_receiver(queue_name=SB_QUEUE, max_wait_time=5)
+
             async with receiver:
                 messages = await receiver.receive_messages(
                     max_message_count=1,
                     max_wait_time=5,
                 )
+
                 if not messages:
                     logging.info("No messages in queue.")
                     return
@@ -70,7 +92,7 @@ async def process_one_message() -> None:
                     blob_url = body["blob_url"]
                     logging.info(f"Processing image_id={image_id}, blob_url={blob_url}")
 
-                    # 1. Set state to Sending
+                    # 3. Update state → q2 Sending
                     async with pool.acquire() as conn:
                         await conn.execute(
                             "UPDATE images SET state = $2 WHERE id = $1",
@@ -78,7 +100,7 @@ async def process_one_message() -> None:
                         )
 
                     try:
-                        # 2. Download image from Blob Storage
+                        # 4. Download the image from Blob Storage
                         blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
                         async with blob_service:
                             blob_name = blob_url.split("/")[-1]
@@ -88,22 +110,25 @@ async def process_one_message() -> None:
                             download = await blob_client.download_blob()
                             image_bytes = await download.readall()
 
-                        # 3. Call Azure Face
-                        face_client = FaceClient(
-                            FACE_ENDPOINT, AzureKeyCredential(FACE_KEY)
-                        )
+                        # 5. Call Azure Face
+                        face_client = FaceClient(FACE_ENDPOINT, AzureKeyCredential(FACE_KEY))
                         async with face_client:
                             result = await face_client.detect(
                                 image_content=image_bytes,
                                 detection_model="detection_03",
                                 return_face_attributes=[
-                                    "glasses", "mask", "headpose",
-                                    "blur", "exposure", "qualityforrecognition",
+                                    "glasses",
+                                    "mask",
+                                    "headpose",
+                                    "blur",
+                                    "exposure",
+                                    "qualityforrecognition",
                                 ],
                             )
                             faces = list(result)
                             count = len(faces)
 
+                            # 6. Determine FSM state based on face count
                             if count == 0:
                                 new_state = "q6 NoFaceDetected"
                             elif count == 1:
@@ -111,7 +136,7 @@ async def process_one_message() -> None:
                             else:
                                 new_state = "q5 MultipleFacesDetected"
 
-                            # Serialize face data
+                            # 7. Serialize the result
                             result_data = []
                             for f in faces:
                                 fa = f.face_attributes
@@ -124,10 +149,9 @@ async def process_one_message() -> None:
                                     "exposure": getattr(getattr(fa, "exposure", None), "exposure_level", None),
                                     "quality": getattr(fa, "quality_for_recognition", None),
                                 })
-
                             result_json = json.dumps(result_data)
 
-                        # 4. Update DB: state → ResultsReady, save result
+                        # 8. Update DB: state → q7 ResultsReady + save result
                         async with pool.acquire() as conn:
                             await conn.execute(
                                 """
@@ -138,7 +162,7 @@ async def process_one_message() -> None:
                                 image_id, "q7 ResultsReady", result_json,
                             )
 
-                            # 5. Increment request counter
+                            # 9. Increment request completion counter
                             await conn.execute(
                                 """
                                 UPDATE requests
@@ -152,18 +176,23 @@ async def process_one_message() -> None:
                                 image_id,
                             )
 
-                        # 6. Complete the message (remove from queue)
+                        # 10. Complete the message (removes it from the queue)
                         await receiver.complete_message(msg)
                         logging.info(f"✅ Completed image_id={image_id} → {new_state}")
 
                     except Exception as e:
                         logging.error(f"❌ Error processing {image_id}: {e}")
-                        # Abandon → message returns to queue for retry
+                        # Abandon → the message returns to the queue for retry
                         await receiver.abandon_message(msg)
 
     finally:
         await pool.close()
 
+
+# ---------- Timer trigger ----------
+# Runs every 30 seconds. The Functions runtime registers this
+# function because of the @app.timer_trigger decorator below.
+# ============================================================
 
 @app.timer_trigger(
     schedule="*/30 * * * * *",
@@ -175,6 +204,7 @@ def worker_timer(myTimer: func.TimerRequest) -> None:
     """Timer trigger — fires every 30 seconds."""
     if myTimer.past_due:
         logging.info("Timer is past due.")
+
     logging.info("⏰ Timer fired — checking queue for one message.")
     try:
         asyncio.run(process_one_message())
