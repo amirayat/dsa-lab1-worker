@@ -58,6 +58,96 @@ def _sniff_image_format(data: bytes) -> str:
     return "unknown"
 
 
+# ---------- Translation (Part 2, Option B) ----------
+
+async def _translate_labels(labels: list[str], target_lang: str) -> dict:
+    """
+    Batch-translate a list of English labels into `target_lang` using the
+    Azure Translator REST API directly via aiohttp.
+    Returns a dict { english_label: translated_text }.
+    On any error, returns an empty dict (translation is best-effort — never blocks the pipeline).
+    """
+    if not labels:
+        return {}
+
+    try:
+        import aiohttp
+
+        key = _env("TRANSLATOR_KEY")
+        region = _env("TRANSLATOR_REGION")
+        endpoint = os.environ.get(
+            "TRANSLATOR_ENDPOINT",
+            "https://api.cognitive.microsofttranslator.com",
+        ).rstrip("/")
+
+        # Deduplicate while preserving order
+        unique = list(dict.fromkeys(labels))
+
+        url = f"{endpoint}/translate?api-version=3.0&to={target_lang}"
+        headers = {
+            "Ocp-Apim-Subscription-Key": key,
+            "Ocp-Apim-Subscription-Region": region,
+            "Content-Type": "application/json",
+        }
+        body = [{"Text": label} for label in unique]
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=body, timeout=15) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logging.warning(
+                        f"Translator returned status {resp.status}: {text[:200]}"
+                    )
+                    return {}
+                data = await resp.json()
+
+        mapping = {}
+        for original, item in zip(unique, data):
+            translations = item.get("translations") or []
+            if translations:
+                mapping[original] = translations[0]["text"]
+
+        logging.info(f"Translated {len(mapping)} labels to '{target_lang}'")
+        return mapping
+
+    except Exception as e:
+        logging.warning(f"Translation failed (non-fatal): {e}")
+        return {}
+
+
+async def _enrich_with_translations(faces_data: list[dict], target_lang: str) -> list[dict]:
+    """
+    Given the Face result list, collect all string values that represent labels,
+    translate them, and add `<field>_<lang>` fields next to each original field.
+    """
+    # Collect all label strings that need translation
+    label_fields = ["glasses", "mask", "blur", "exposure", "quality"]
+    labels_to_translate = set()
+    for face in faces_data:
+        for field in label_fields:
+            val = face.get(field)
+            if isinstance(val, str) and val:
+                labels_to_translate.add(val)
+
+    if not labels_to_translate:
+        return faces_data
+
+    mapping = await _translate_labels(list(labels_to_translate), target_lang)
+    if not mapping:
+        # Translation service failed — return original data untouched
+        return faces_data
+
+    # Enrich each face
+    suffix = f"_{target_lang}"
+    for face in faces_data:
+        for field in label_fields:
+            original = face.get(field)
+            if isinstance(original, str) and original in mapping:
+                face[f"{field}{suffix}"] = mapping[original]
+
+    return faces_data
+
+
 # ---------- Worker logic ----------
 
 async def process_one_message() -> None:
@@ -82,6 +172,7 @@ async def process_one_message() -> None:
     BLOB_CONTAINER = _env("BLOB_CONTAINER_NAME")
     FACE_KEY = _env("AZURE_FACE_KEY")
     FACE_ENDPOINT = _env("AZURE_FACE_ENDPOINT")
+    TRANSLATOR_TARGET_LANG = os.environ.get("TRANSLATOR_TARGET_LANG", "ro")
 
     pool = await asyncpg.create_pool(
         host=POSTGRES_HOST,
@@ -225,7 +316,14 @@ async def process_one_message() -> None:
                                     "exposure": getattr(getattr(fa, "exposure", None), "exposure_level", None),
                                     "quality": getattr(fa, "quality_for_recognition", None),
                                 })
-                            result_json = json.dumps(result_data)
+
+                        # ---------- Translate labels (Part 2, Option B) ----------
+                        if result_data:
+                            result_data = await _enrich_with_translations(
+                                result_data, TRANSLATOR_TARGET_LANG,
+                            )
+
+                        result_json = json.dumps(result_data)
 
                         # ---------- Update DB ----------
                         async with pool.acquire() as conn:
