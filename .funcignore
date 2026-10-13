@@ -6,6 +6,3 @@ __queuestorage__
 local.settings.json
 test
 .venv
-__pycache__
-*.pyc
-*.md
